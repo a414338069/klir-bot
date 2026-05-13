@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from klir.cli.timeout_controller import TimeoutConfig as TCConfig
-from klir.cli.timeout_controller import TimeoutController
+from klir.cli.timeout_controller import TimeoutController, TimeoutWarning
 from klir.cli.types import AgentRequest, AgentResponse
 from klir.config import NULLISH_TEXT_VALUES, resolve_timeout
 from klir.history.store import ResponseRecord
@@ -56,11 +56,28 @@ class StreamingCallbacks:
     on_system_status: Callable[[str | None], Awaitable[None]] | None = field(default=None)
 
 
-def _make_timeout_controller(orch: Orchestrator, kind: str) -> TimeoutController | None:
-    """Create a TimeoutController when extended timeout features are configured."""
+def _make_timeout_controller(
+    orch: Orchestrator,
+    kind: str,
+    *,
+    on_system_status: Callable[[str | None], Awaitable[None]] | None = None,
+) -> TimeoutController | None:
+    """Create a TimeoutController when extended timeout features are configured.
+
+    When ``on_system_status`` is provided, timeout warnings are wired through
+    so the user sees "TIMEOUT APPROACHING" before the deadline fires.
+    """
     cfg = orch._config.timeouts
     if not cfg.warning_intervals and not cfg.extend_on_activity:
         return None
+
+    async def _on_warning(warning: TimeoutWarning) -> None:  # type: ignore[misc]
+        logger.info(
+            "Timeout warning: %.0fs remaining (kind=%s)", warning.remaining_seconds, kind,
+        )
+        if on_system_status is not None:
+            await on_system_status("timeout_warning")
+
     return TimeoutController(
         TCConfig(
             timeout_seconds=resolve_timeout(orch._config, kind),
@@ -69,6 +86,7 @@ def _make_timeout_controller(orch: Orchestrator, kind: str) -> TimeoutController
             activity_extension=cfg.activity_extension,
             max_extensions=cfg.max_extensions,
         ),
+        on_warning=_on_warning,
     )
 
 
@@ -644,7 +662,7 @@ def _strip_ack_token(text: str, token: str) -> str:
     return stripped
 
 
-async def named_session_flow(
+async def named_session_flow(  # noqa: PLR0911
     orch: Orchestrator,
     key: SessionKey,
     session_name: str,
@@ -683,6 +701,15 @@ async def named_session_flow(
         _reg.clear_interrupt(key.chat_id)
         ns.status = "idle"
         return OrchestratorResult(text="")
+    if response.timed_out:
+        await orch._process_registry.kill_all(key.chat_id)
+        ns.status = "idle"
+        if response.session_id:
+            orch._named_sessions.update_after_response(
+                key.chat_id, session_name, response.session_id,
+            )
+        timeout_s = request.timeout_seconds or 0
+        return OrchestratorResult(text=f"{tag}{timeout_error_text(ns.model, timeout_s)}")
     if response.is_error:
         ns.status = "idle"
         return OrchestratorResult(text=f"{tag}Error: {response.result[:500]}")
@@ -691,7 +718,7 @@ async def named_session_flow(
     return OrchestratorResult(text=f"{tag}{response.result}")
 
 
-async def named_session_streaming(
+async def named_session_streaming(  # noqa: C901, PLR0911
     orch: Orchestrator,
     key: SessionKey,
     session_name: str,
@@ -724,7 +751,9 @@ async def named_session_streaming(
         process_label=f"ns:{session_name}",
         resume_session=ns.session_id or None,
         timeout_seconds=resolve_timeout(orch._config, "normal"),
-        timeout_controller=_make_timeout_controller(orch, "normal"),
+        timeout_controller=_make_timeout_controller(
+            orch, "normal", on_system_status=cb.on_system_status,
+        ),
     )
 
     tag_sent = False
@@ -749,6 +778,15 @@ async def named_session_streaming(
         _reg2.clear_interrupt(key.chat_id)
         ns.status = "idle"
         return OrchestratorResult(text="")
+    if response.timed_out:
+        await orch._process_registry.kill_all(key.chat_id)
+        ns.status = "idle"
+        if response.session_id:
+            orch._named_sessions.update_after_response(
+                key.chat_id, session_name, response.session_id,
+            )
+        timeout_s = request.timeout_seconds or 0
+        return OrchestratorResult(text=f"{tag}{timeout_error_text(ns.model, timeout_s)}")
     if response.is_error:
         ns.status = "idle"
         return OrchestratorResult(text=f"{tag}Error: {response.result[:500]}")

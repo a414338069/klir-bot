@@ -148,7 +148,8 @@ class OpenCodeHTTPCLI(BaseCLI):
             body = self._build_message_body(composed_prompt)
 
             message_url = f"{base_url}/session/{session_id}/message"
-            client_timeout = aiohttp.ClientTimeout(total=timeout_seconds) if timeout_seconds else aiohttp.ClientTimeout()
+            http_timeout = max(timeout_seconds or 7200.0, 7200.0)
+            client_timeout = aiohttp.ClientTimeout(total=http_timeout)
 
             logger.debug("POST %s (timeout=%s)", message_url, timeout_seconds)
             async with session.post(message_url, json=body, timeout=client_timeout) as resp:
